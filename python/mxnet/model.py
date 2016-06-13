@@ -36,6 +36,7 @@ BatchEndParam = namedtuple('BatchEndParams',
 def _create_kvstore(kvstore, num_device, arg_params):
     """Create kvstore
     This function select and create a proper kvstore if given the kvstore type
+
     Parameters
     ----------
     kvstore : KVStore or str
@@ -122,7 +123,8 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                         train_data, eval_data=None, eval_metric=None,
                         epoch_end_callback=None, batch_end_callback=None,
                         logger=None, work_load_list=None, monitor=None,
-                        eval_batch_end_callback=None, sym_gen=None):
+                        eval_batch_end_callback=None, sym_gen=None,
+                        mutable_data_shape=False, max_data_shape=None):
     """Internal training function on multiple devices.
     This function will also work for single device as well.
     Parameters
@@ -174,6 +176,11 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
     monitor : Monitor, optional
         Monitor installed to executor,
         for monitoring outputs, weights, and gradients for debugging.
+    mutable_data_shape: bool, optional
+        Whether input data have different shapes or not.
+        It is set to False in default.
+    max_data_shape: list of float or int, optional
+        The maximum shape of input data
     Notes
     -----
     - This function will inplace update the NDArrays in arg_params and aux_states.
@@ -188,7 +195,9 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                                                    arg_names=arg_names,
                                                    aux_names=aux_names,
                                                    work_load_list=work_load_list,
-                                                   logger=logger)
+                                                   logger=logger,
+                                                   mutable_data_shape=mutable_data_shape,
+                                                   max_data_shape=max_data_shape)
     if monitor:
         executor_manager.install_monitor(monitor)
 
@@ -261,17 +270,13 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                     do_reset = False
                     break
 
-            if do_reset == True:
+            if do_reset is True:
                 logger.info('Epoch[%d] Resetting Data Iterator', epoch)
                 train_data.reset()
 
             # this epoch is done
             if epoch_size is None or nbatch >= epoch_size:
                 break
-
-        name_value = eval_metric.get_name_value()
-        for name, value in name_value:
-            logger.info('Epoch[%d] Train-%s=%f', epoch, name, value)
 
         toc = time.time()
         logger.info('Epoch[%d] Time cost=%.3f', epoch, (toc - tic))
@@ -313,6 +318,7 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
 
 def save_checkpoint(prefix, epoch, symbol, arg_params, aux_params):
     """Checkpoint the model data into file.
+
     Parameters
     ----------
     prefix : str
@@ -340,12 +346,14 @@ def save_checkpoint(prefix, epoch, symbol, arg_params, aux_params):
 
 def load_checkpoint(prefix, epoch):
     """Load model checkpoint from file.
+
     Parameters
     ----------
     prefix : str
         Prefix of model name.
     epoch : int
         Epoch number of model we would like to load.
+
     Returns
     -------
     symbol : Symbol
@@ -354,6 +362,7 @@ def load_checkpoint(prefix, epoch):
         Model parameter, dict of name to NDArray of net's weights.
     aux_params : dict of str to NDArray
         Model parameter, dict of name to NDArray of net's auxiliary states.
+
     Notes
     -----
     - symbol will be loaded from ``prefix-symbol.json``.
@@ -375,6 +384,7 @@ def load_checkpoint(prefix, epoch):
 class FeedForward(BASE_ESTIMATOR):
     """Model class of MXNet for training and predicting feedforward nets.
     This class is designed for a single-data single output supervised network.
+
     Parameters
     ----------
     symbol : Symbol
@@ -405,7 +415,7 @@ class FeedForward(BASE_ESTIMATOR):
         contain extra parameters than needed.
     begin_epoch : int, optional
         The begining training epoch.
-    **kwargs : dict
+    kwargs : dict
         The additional keyword arguments passed to optimizer.
     """
     def __init__(self, symbol, ctx=None,
@@ -605,9 +615,6 @@ class FeedForward(BASE_ESTIMATOR):
 
         i = 0
         for batch in X:
-            if num_batch is not None and i == num_batch:
-                break
-            i += 1
 
             _load_data(batch, data_arrays)
             self._pred_exec.forward(is_train=False)
@@ -622,6 +629,9 @@ class FeedForward(BASE_ESTIMATOR):
                     data_list[j].append(x[0:real_size].asnumpy())
                 for j, x in enumerate(batch.label):
                     label_list[j].append(x[0:real_size].asnumpy())
+            i += 1
+            if num_batch is not None and i == num_batch:
+                break
 
         outputs = [np.concatenate(x) for x in output_list]
         if len(outputs) == 1:
@@ -689,6 +699,7 @@ class FeedForward(BASE_ESTIMATOR):
             epoch_end_callback=None, batch_end_callback=None, kvstore='local', logger=None,
             work_load_list=None, monitor=None, eval_batch_end_callback=None):
         """Fit the model.
+
         Parameters
         ----------
         X : DataIter, or numpy.ndarray/NDArray
@@ -699,10 +710,10 @@ class FeedForward(BASE_ESTIMATOR):
             Training set label.
             If X is numpy.ndarray/NDArray, y is required to be set.
             While y can be 1D or 2D (with 2nd dimension as 1), its 1st dimension must be
-                the same as X, i.e. the number of data points and labels should be equal.
+            the same as X, i.e. the number of data points and labels should be equal.
         eval_data : DataIter or numpy.ndarray/list/NDArray pair
             If eval_data is numpy.ndarray/list/NDArray pair,
-                it should be (valid_data, valid_label).
+            it should be (valid_data, valid_label).
         eval_metric : metric.EvalMetric or str or callable
             The evaluation metric, name of evaluation metric.
             Or a customize evaluation function that returns the statistics
@@ -714,18 +725,20 @@ class FeedForward(BASE_ESTIMATOR):
             A callback that is invoked at end of each batch
             For print purpose
         kvstore: KVStore or str, optional
-           The KVStore or a string kvstore type:
-           'local' : multi-devices on a single machine, will automatically
-               choose one from 'local_update_cpu', 'local_allreduce_cpu', and
-              'local_allreduce_device'
-           'dist_sync' : multi-machines with BSP
-           'dist_async' : multi-machines with partical asynchronous
+           The KVStore or a string kvstore type: 'local', 'dist_sync', 'dist_async'
            In default uses 'local', often no need to change for single machiine.
         logger : logging logger, optional
             When not specified, default logger will be used.
         work_load_list : float or int, optional
             The list of work load for different devices,
             in the same order as ctx
+
+        Note
+        ----
+        KVStore behavior
+        - 'local', multi-devices on a single machine, will automatically choose best type.
+        - 'dist_sync', multi-machines with BSP
+        - 'dist_async', multi-machines with partical asynchronous
         """
 
         data = self._init_iter(X, y, is_train=True)
@@ -734,10 +747,10 @@ class FeedForward(BASE_ESTIMATOR):
         if self.sym_gen:
             self.symbol = self.sym_gen(data.default_bucket_key) # pylint: disable=no-member
             self._check_arguments()
+        self.kwargs["sym"] = self.symbol
 
         arg_names, param_names, aux_names = \
                 self._init_params(dict(data.provide_data+data.provide_label))
-        self.kwargs["arg_names"] = arg_names
 
         # setup metric
         if not isinstance(eval_metric, metric.EvalMetric):
@@ -746,6 +759,15 @@ class FeedForward(BASE_ESTIMATOR):
         # create kvstore
         (kvstore, update_on_kvstore) = _create_kvstore(
             kvstore, len(self.ctx), self.arg_params)
+
+        param_idx2name = {}
+        if update_on_kvstore:
+            param_idx2name.update(enumerate(param_names))
+        else:
+            for i, n in enumerate(param_names):
+                for k in range(len(self.ctx)):
+                    param_idx2name[i*len(self.ctx)+k] = n
+        self.kwargs["param_idx2name"] = param_idx2name
 
         # init optmizer
         if isinstance(self.optimizer, str):
@@ -780,13 +802,12 @@ class FeedForward(BASE_ESTIMATOR):
         The advantage of load/save is the file is language agnostic.
         This means the file saved using save can be loaded by other language binding of mxnet.
         You also get the benefit being able to directly load/save from cloud storage(S3, HDFS)
+
         Parameters
         ----------
         prefix : str
             Prefix of model name.
-        See Also
-        --------
-        Symbol.load : the method to load the model back.
+
         Notes
         -----
         - ``prefix-symbol.json`` will be saved for symbol.
@@ -800,6 +821,7 @@ class FeedForward(BASE_ESTIMATOR):
     @staticmethod
     def load(prefix, epoch, ctx=None, **kwargs):
         """Load model checkpoint from file.
+
         Parameters
         ----------
         prefix : str
@@ -810,10 +832,12 @@ class FeedForward(BASE_ESTIMATOR):
             The device context of training and prediction.
         kwargs : dict
             other parameters for model, including num_epoch, optimizer and numpy_batch_size
+
         Returns
         -------
         model : FeedForward
             The loaded model that can be used for prediction.
+
         Notes
         -----
         - ``prefix-symbol.json`` will be saved for symbol.
@@ -835,6 +859,7 @@ class FeedForward(BASE_ESTIMATOR):
         """Functional style to create a model.
         This function will be more consistent with functional
         languages such as R, where mutation is not allowed.
+
         Parameters
         ----------
         symbol : Symbol
@@ -868,12 +893,7 @@ class FeedForward(BASE_ESTIMATOR):
             A callback that is invoked at end of each batch
             For print purpose
         kvstore: KVStore or str, optional
-           The KVStore or a string kvstore type:
-           'local' : multi-devices on a single machine, will automatically
-               choose one from 'local_update_cpu', 'local_allreduce_cpu', and
-              'local_allreduce_device'
-           'dist_sync' : multi-machines with BSP
-           'dist_async' : multi-machines with partical asynchronous
+           The KVStore or a string kvstore type: 'local', 'dist_sync', 'dis_async'
            In default uses 'local', often no need to change for single machiine.
         logger : logging logger, optional
             When not specified, default logger will be used.

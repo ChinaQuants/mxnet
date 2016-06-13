@@ -1,5 +1,5 @@
 # coding: utf-8
-# pylint: disable=invalid-name, protected-access, too-many-locals, too-many-arguments
+# pylint: disable=invalid-name, protected-access, too-many-locals, too-many-arguments, too-many-statements
 """Executor manager"""
 from __future__ import absolute_import
 
@@ -8,6 +8,7 @@ from . import ndarray as nd
 from .context import cpu
 
 import logging
+import numpy as np
 
 def _split_input_slice(batch_size, work_load_list):
     """Get input slice from the input shape.
@@ -79,7 +80,12 @@ def _load_general(data, targets):
             d_src.copyto(d_targets)
         else:
             for slice_idx, d_dst in d_targets:
-                d_src[slice_idx].copyto(d_dst)
+                if d_src[slice_idx].shape != d_dst.shape:
+                    n = d_dst.shape[0] / (slice_idx.stop - slice_idx.start)
+                    new_slice = slice(slice_idx.start * n, slice_idx.stop * n)
+                    d_src[new_slice].copyto(d_dst)
+                else:
+                    d_src[slice_idx].copyto(d_dst)
 
 def _load_data(batch, targets):
     """Load data into sliced arrays"""
@@ -91,7 +97,7 @@ def _load_label(batch, targets):
 
 # pylint: disable=too-many-branches
 def _bind_exec(sym, ctx, input_shapes, param_names, need_grad=False,
-               base_exec=None, shared_data_arrays=None, input_types=None):
+               base_exec=None, shared_data_arrays=None, input_types=None, logger=logging):
     """bind executor for bucketing, potentially sharing data with an existing executor."""
     arg_shape, _, aux_shape = sym.infer_shape(**input_shapes)
     assert(arg_shape is not None)
@@ -125,15 +131,27 @@ def _bind_exec(sym, ctx, input_shapes, param_names, need_grad=False,
                     name in shared_data_arrays:
                 arg_arr = shared_data_arrays[name]
 
-                # in bucketing, we want to be strict here to avoid
-                # potential bugs
-                assert(arg_shape[i] == arg_arr.shape)
-                assert(arg_types[i] == arg_arr.dtype)
+                if np.prod(arg_arr.shape) >= np.prod(arg_shape[i]):
+                    # good, we can share this memory
+                    assert(arg_types[i] == arg_arr.dtype)
+                    arg_arr = arg_arr.reshape(arg_shape[i])
+                else:
+                    logger.warning(('bucketing: data "%s" has a shape %s' % (name, arg_shape[i])) +
+                                   (', which is larger than already allocated ') +
+                                   ('shape %s' % (arg_arr.shape,)) +
+                                   ('. Need to re-allocate. Consider putting ') +
+                                   ('default_bucket_key to be the bucket taking the largest ') +
+                                   ('input for better memory sharing.'))
+                    arg_arr = nd.zeros(arg_shape[i], ctx, dtype=arg_types[i])
+
+                    # replace existing shared array because the new one is bigger
+                    shared_data_arrays[name] = arg_arr
             else:
                 arg_arr = nd.zeros(arg_shape[i], ctx, dtype=arg_types[i])
+                if shared_data_arrays is not None:
+                    shared_data_arrays[name] = arg_arr
+
             arg_arrays.append(arg_arr)
-            if shared_data_arrays is not None:
-                shared_data_arrays[name] = arg_arr
         else:
             # model parameter
             if base_exec is None:
@@ -151,7 +169,7 @@ def _bind_exec(sym, ctx, input_shapes, param_names, need_grad=False,
 
     # create or borrow aux variables
     if base_exec is None:
-        aux_arrays = [nd.zeros(s, ctx, dtype=t) for s, t in zip(aux_shape, arg_types)]
+        aux_arrays = [nd.zeros(s, ctx, dtype=t) for s, t in zip(aux_shape, aux_types)]
     else:
         for i, a in enumerate(base_exec.aux_arrays):
             assert aux_shape[i] == a.shape
@@ -183,10 +201,14 @@ class DataParallelExecutorGroup(object):
         The dataset for training. It could be any object with `provide_data` and
         `provide_label` properties. Loading of actual data is not necessarily needed
         at this stage.
+    max_data_shape: list of float or int
+        Maximum shape of input data
     shared_grop: DataParallelExecutorGroup
         An existing executor group, if to share parameters with it.
     """
-    def __init__(self, sym, arg_names, param_names, ctx, slices, train_data, shared_group=None):
+    def __init__(self, sym, arg_names, param_names,
+                 ctx, slices, train_data,
+                 max_data_shape=None, shared_group=None):
         # make sure the architecture is valid
         _check_arguments(sym)
 
@@ -203,8 +225,23 @@ class DataParallelExecutorGroup(object):
 
         self.train_execs = []
         for i in range(len(ctx)):
-            data_shapes = {k: tuple([slices[i].stop-slices[i].start] + list(v[1:]))
-                           for k, v in train_data.provide_data + train_data.provide_label}
+            data_shapes = {}
+            batch_size = 0
+            for k, v in train_data.provide_data:
+                if k == 'data':
+                    batch_size = v[0]
+            for k, v in train_data.provide_data + train_data.provide_label:
+                if k == 'data':
+                    if shared_group is None and max_data_shape is not None:
+                        # init first executor group
+                        # data size is set to max possible size of input data
+                        data_shapes[k] = tuple([slices[i].stop - slices[i].start] + max_data_shape)
+                    else:
+                        data_shapes[k] = tuple([slices[i].stop - slices[i].start] + list(v[1:]))
+                else:
+                    data_shapes[k] = tuple([int((slices[i].stop - slices[i].start) * v[0] \
+                                           / batch_size)] + list(v[1:]))
+
             shared_exec = None if shared_group is None else shared_group.train_execs[i]
             train_exec = _bind_exec(sym, ctx[i], data_shapes, self.param_names,
                                     need_grad=True, base_exec=shared_exec,
@@ -245,7 +282,9 @@ class DataParallelExecutorGroup(object):
     def update_metric(self, metric, labels):
         """ Update evaluation metric with label and current outputs """
         for texec, islice in zip(self.train_execs, self.slices):
-            labels_slice = [label[islice] for label in labels]
+            n = int(texec.outputs[0].shape[0] / (islice.stop - islice.start))
+            new_slice = slice(islice.start * n, islice.stop * n)
+            labels_slice = [label[new_slice] for label in labels]
             metric.update(labels_slice, texec.outputs)
 
 class DataParallelExecutorManager(object):
@@ -271,10 +310,15 @@ class DataParallelExecutorManager(object):
         When not specified, default logger will be used.
     sym_gen : a function that generate new Symbols depending on different
         input shapes. Used only for bucketing.
+    mutable_data_shape: bool
+        Whether input data have different shapes or not.
+    max_data_shape: list of float or int
+        The maximum shape of input data
     """
     def __init__(self, symbol, ctx, train_data,
                  arg_names, param_names, aux_names,
-                 work_load_list=None, logger=None, sym_gen=None):
+                 work_load_list=None, logger=None, sym_gen=None,
+                 mutable_data_shape=False, max_data_shape=None):
         if logger is None:
             logger = logging
         # preparation
@@ -293,9 +337,10 @@ class DataParallelExecutorManager(object):
         self.param_names = param_names
         self.aux_names = aux_names
         self.ctx = ctx
+        self.mutable_data_shape = mutable_data_shape
 
         self.execgrp = DataParallelExecutorGroup(symbol, self.arg_names, self.param_names, self.ctx,
-                                                 self.slices, train_data)
+                                                 self.slices, train_data, max_data_shape)
         self.symbol = symbol
 
         self.sym_gen = sym_gen
@@ -375,9 +420,15 @@ class DataParallelExecutorManager(object):
                 self.execgrp_bucket[key] = execgrp
 
             self.curr_execgrp = self.execgrp_bucket[key]
+        elif self.mutable_data_shape is True:
+            # for each data batch, generate new execgrp and share params with the initial one
+            execgrp = DataParallelExecutorGroup(self.symbol, self.arg_names,
+                                                self.param_names, self.ctx,
+                                                self.slices, data_batch,
+                                                shared_group=self.execgrp)
+            self.curr_execgrp = execgrp
         else:
             self.curr_execgrp = self.execgrp
-
         self.curr_execgrp.load_data_batch(data_batch)
 
     def forward(self, is_train=False):
