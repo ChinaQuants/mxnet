@@ -1,4 +1,4 @@
-# pylint: disable=too-many-instance-attributes, too-many-arguments, protected-access
+# pylint: disable=too-many-instance-attributes, too-many-arguments, protected-access, too-many-branches
 """A `Module` implement the `BaseModule` API by wrapping a `Symbol` and one or
 more `Executor` for data parallelization.
 """
@@ -14,6 +14,8 @@ from ..model import _create_kvstore, _initialize_kvstore, _update_params, _updat
 from ..initializer import Uniform
 
 from .base_module import BaseModule
+from ..io import DataDesc
+from ..base import mx_real_t
 
 class Module(BaseModule):
     """Module is a basic module that wrap a `Symbol`. It is functionally the same
@@ -33,9 +35,11 @@ class Module(BaseModule):
         Default is `cpu()`.
     work_load_list : list of number
         Default `None`, indicating uniform workload.
+    fixed_param_names: list of str
+        Default `None`, indicating no network parameters are fixed.
     """
     def __init__(self, symbol, data_names=('data',), label_names=('softmax_label',),
-                 logger=logging, context=ctx.cpu(), work_load_list=None):
+                 logger=logging, context=ctx.cpu(), work_load_list=None, fixed_param_names=None):
         super(Module, self).__init__(logger=logger)
 
         if isinstance(context, ctx.Context):
@@ -54,6 +58,7 @@ class Module(BaseModule):
         arg_names = symbol.list_arguments()
         input_names = data_names + label_names
         self._param_names = [x for x in arg_names if x not in input_names]
+        self._fixed_param_names = fixed_param_names
         self._aux_names = symbol.list_auxiliary_states()
         self._data_names = data_names
         self._label_names = label_names
@@ -159,25 +164,33 @@ class Module(BaseModule):
         assert self.binded, 'call bind before initializing the parameters'
 
         if self._arg_params is None:
-            param_arrays = [nd.zeros(x[0].shape) for x in self._exec_group.param_arrays]
+            param_arrays = [
+                nd.zeros(x[0].shape, dtype=x[0].dtype)
+                for x in self._exec_group.param_arrays
+            ]
             self._arg_params = {name:arr for name, arr in zip(self._param_names, param_arrays)}
 
         if self._aux_params is None:
-            aux_arrays = [nd.zeros(x[0].shape) for x in self._exec_group.aux_arrays]
+            aux_arrays = [
+                nd.zeros(x[0].shape, dtype=x[0].dtype)
+                for x in self._exec_group.aux_arrays
+            ]
             self._aux_params = {name:arr for name, arr in zip(self._aux_names, aux_arrays)}
 
         def _impl(name, arr, cache):
             """Internal helper for parameter initialization"""
             if cache is not None:
-                if cache.has_key(name):
+                if name in cache:
                     cache_arr = cache[name]
 
                     # just in case the cached array is just the target itself
                     if cache_arr is not arr:
                         cache_arr.copyto(arr)
                 else:
-                    assert allow_missing
-                    initializer(name, arr)
+                    if not allow_missing:
+                        raise RuntimeError("%s is not presented" % name)
+                    if initializer != None:
+                        initializer(name, arr)
             else:
                 initializer(name, arr)
 
@@ -194,7 +207,8 @@ class Module(BaseModule):
         self._exec_group.set_params(self._arg_params, self._aux_params)
 
     def bind(self, data_shapes, label_shapes=None, for_training=True,
-             inputs_need_grad=False, force_rebind=False, shared_module=None):
+             inputs_need_grad=False, force_rebind=False, shared_module=None,
+             grad_req='write'):
         """Bind the symbols to construct executors. This is necessary before one
         can perform computation with the module.
 
@@ -249,18 +263,30 @@ class Module(BaseModule):
         else:
             shared_group = None
 
+        input_types = dict((x.name, x.dtype)
+                           if isinstance(x, DataDesc) else (x[0], mx_real_t)
+                           for x in data_shapes)
+
+        if label_shapes is not None:
+            for item in label_shapes:
+                if isinstance(item, DataDesc):
+                    input_types[item.name] = item.dtype
+                else:
+                    input_types[item[0]] = mx_real_t
+
         self._exec_group = DataParallelExecutorGroup(self._symbol, self._context,
                                                      self._work_load_list, data_shapes,
                                                      label_shapes, self._param_names,
                                                      for_training, inputs_need_grad,
-                                                     shared_group, logger=self.logger)
-
+                                                     shared_group, logger=self.logger,
+                                                     fixed_param_names=self._fixed_param_names,
+                                                     layout_mapper=self.layout_mapper,
+                                                     grad_req=grad_req, input_types=input_types)
         if shared_module is not None:
             self.params_initialized = True
             self._arg_params = shared_module._arg_params
             self._aux_params = shared_module._aux_params
-
-        if self.params_initialized:
+        elif self.params_initialized:
             # if the parameters are already initialized, we are re-binding
             # so automatically copy the already initialized params
             self._exec_group.set_params(self._arg_params, self._aux_params)
@@ -299,9 +325,12 @@ class Module(BaseModule):
             if kvstore and kvstore.type == 'dist_sync':
                 batch_size *= kvstore.num_workers
             idx2name = {}
-            for k in range(len(self._context)):
-                idx2name.update({i*len(self._context)+k: n
-                                 for i, n in enumerate(self._exec_group.param_names)})
+            if update_on_kvstore:
+                idx2name.update(enumerate(self._exec_group.param_names))
+            else:
+                for k in range(len(self._context)):
+                    idx2name.update({i*len(self._context)+k: n
+                                     for i, n in enumerate(self._exec_group.param_names)})
             optimizer_params = dict(optimizer_params)
             if 'rescale_grad' not in optimizer_params:
                 optimizer_params['rescale_grad'] = 1.0/batch_size
@@ -446,3 +475,8 @@ class Module(BaseModule):
         latest parameters from `self._arg_params` and `self._aux_params`.
         """
         self._exec_group.get_params(self._arg_params, self._aux_params)
+
+    def install_monitor(self, mon):
+        """ Install monitor on all executors """
+        assert self.binded
+        self._exec_group.install_monitor(mon)

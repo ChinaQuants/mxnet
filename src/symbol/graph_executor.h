@@ -16,6 +16,11 @@
 #include "./static_graph.h"
 #include "./graph_memory_allocator.h"
 
+#if MKL_EXPERIMENTAL == 1
+#include <mkl_memory.h>
+#endif
+
+
 namespace mxnet {
 /*!
  * \brief Executor of a computation graph.
@@ -46,6 +51,7 @@ class GraphExecutor : public Executor {
                    const std::vector<NDArray> &aux_states,
                    Executor* shared_exec = nullptr) {
     enable_inplace_allocation_ = dmlc::GetEnv("MXNET_EXEC_ENABLE_INPLACE", true);
+    prefer_bulk_execution_ = dmlc::GetEnv("MXNET_EXEC_PREFER_BULK_EXEC", true);
     if (shared_exec != NULL) {
       GraphExecutor* gexec = dynamic_cast<GraphExecutor*>(shared_exec);
       CHECK(gexec) << "Input executor for sharing memory must have GraphExecutor type.";
@@ -63,9 +69,11 @@ class GraphExecutor : public Executor {
                     in_args, arg_grad_store, grad_req_type,
                     need_backward);
     this->InitDataEntryInfo(in_args, arg_grad_store, grad_req_type, aux_states);
+    this->InitOperators();
     this->InitDataEntryMemory();
     this->InitResources();
-    this->InitOpNodes();
+    this->InitCachedOps();
+    this->InitOpSegs();
   }
 
  protected:
@@ -86,6 +94,10 @@ class GraphExecutor : public Executor {
   struct DataEntryInfo {
     // the actual data for the entry
     NDArray data;
+    // mkl private memory holder
+#if MKL_EXPERIMENTAL == 1
+    std::shared_ptr<MKLMemHolder> mkl_mem_;
+#endif
     // write request to this entry
     OpReqType op_req;
     // the operatio node that will take
@@ -111,7 +123,11 @@ class GraphExecutor : public Executor {
           inplace_op_id(-1),
           type(kNotInitialized),
           storage_id(GraphStorageAllocator::kBadStorageID),
-          temp_ref_count(0), ref_count(0) {}
+          temp_ref_count(0), ref_count(0) {
+#if MKL_EXPERIMENTAL == 1
+            mkl_mem_ = MKLMemHolder::create();
+#endif
+          }
   };
   // all the information needed to push the op to engine
   struct OpExecEntry {
@@ -156,6 +172,17 @@ class GraphExecutor : public Executor {
       }
     }
   };
+  // a cached segment operator that executes a segment
+  struct CachedSegOpr {
+    // context of the operator
+    Context ctx;
+    // begin in topo order
+    size_t topo_begin;
+    // end in topo order
+    size_t topo_end;
+    // the cached operator
+    Engine::OprHandle opr;
+  };
   /*!
    * \brief Get input option of a node.
    *  This function is overriden for both Forward and Backward node.
@@ -191,6 +218,14 @@ class GraphExecutor : public Executor {
    * \return the execution entry.
    */
   inline OpExecEntry GetOpExecEntry(uint32_t node_id);
+  /*!
+   * \brief Try to create a cached operator to run segments between start and end
+   * \param topo_start beginning of segment
+   * \param topo_end end of segment
+   * \return the cached operator.
+   * The ret.opr can be nullptr if tyhe creation failed
+   */
+  CachedSegOpr CreateCachedSegOpr(size_t topo_start, size_t topo_end);
   // initialize the internal graph structure
   void InitGraph(const Symbol &symbol,
                  const Context& default_ctx,
@@ -209,7 +244,11 @@ class GraphExecutor : public Executor {
   // initialize the internal resources for each op
   void InitResources();
   // initialize OpNode data structure
-  void InitOpNodes();
+  void InitOperators();
+  // initialize OpNode data structure
+  void InitCachedOps();
+  // initialize segments of code to run together as a group.
+  void InitOpSegs();
   // assign context to the graph, this will mutate the graph.
   void AssignContext(const Context default_ctx,
                      const std::map<std::string, Context>& ctx_map,
@@ -232,6 +271,8 @@ class GraphExecutor : public Executor {
   size_t total_allocated_temp_;
   // number of forward nodes in the graph
   size_t num_forward_nodes_;
+  // whether to enable bulk execution
+  bool prefer_bulk_execution_;
   // head gradient node in the graph, if there is backward pass
   std::vector<uint32_t> head_grad_nodes_;
   // mirror map of nodes, experimental feature, normally can be ignored.
@@ -246,6 +287,8 @@ class GraphExecutor : public Executor {
   std::shared_ptr<GraphStoragePool> shared_mem_;
   // monitor call back
   std::function<void(const char*, void*)> monitor_callback_;
+  // cached segment operator
+  std::vector<CachedSegOpr> cached_seg_opr_;
 };  // class GraphExecutor
 }  // namespace mxnet
 #endif  // MXNET_SYMBOL_GRAPH_EXECUTOR_H_

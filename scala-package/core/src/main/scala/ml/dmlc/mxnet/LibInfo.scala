@@ -39,6 +39,13 @@ class LibInfo {
                            useVars: Array[NDArrayHandle],
                            scalarArgs: Array[MXFloat],
                            mutateVars: Array[NDArrayHandle]): Int
+  @native def mxFuncInvokeEx(function: FunctionHandle,
+                             useVars: Array[NDArrayHandle],
+                             scalarArgs: Array[MXFloat],
+                             mutateVars: Array[NDArrayHandle],
+                             numParams: Int,
+                             paramKeys: Array[Array[Byte]],
+                             paramVals: Array[Array[Byte]]): Int
   @native def mxNDArrayGetShape(handle: NDArrayHandle,
                                 ndim: MXUintRef,
                                 data: ArrayBuffer[Int]): Int
@@ -49,6 +56,10 @@ class LibInfo {
                              start: MXUint,
                              end: MXUint,
                              sliceHandle: NDArrayHandleRef): Int
+  @native def mxNDArrayReshape(handle: NDArrayHandle,
+                               nDim: Int,
+                               dims: Array[Int],
+                               reshapeHandle: NDArrayHandleRef): Int
   @native def mxNDArraySyncCopyFromCPU(handle: NDArrayHandle,
                                        source: Array[MXFloat],
                                        size: Int): Int
@@ -67,6 +78,7 @@ class LibInfo {
   // KVStore Server
   @native def mxInitPSEnv(keys: Array[String], values: Array[String]): Int
   @native def mxKVStoreRunServer(handle: KVStoreHandle, controller: KVServerControllerCallback): Int
+  @native def mxKVStoreGetNumDeadNode(handle: KVStoreHandle, nodeId: Int, number: RefInt): Int
 
   // KVStore
   @native def mxKVStoreCreate(name: String, handle: KVStoreHandleRef): Int
@@ -92,6 +104,7 @@ class LibInfo {
   @native def mxKVStoreBarrier(handle: KVStoreHandle): Int
   @native def mxKVStoreGetGroupSize(handle: KVStoreHandle, size: RefInt): Int
   @native def mxKVStoreGetRank(handle: KVStoreHandle, size: RefInt): Int
+  @native def mxKVStoreSetBarrierBeforeExit(handle: KVStoreHandle, doBarrier: Int): Int
   @native def mxKVStoreFree(handle: KVStoreHandle): Int
 
   // DataIter Funcs
@@ -194,6 +207,20 @@ class LibInfo {
                               reqsArray: Array[Int],
                               auxArgsHandle: Array[NDArrayHandle],
                               out: ExecutorHandleRef): Int
+  @native def mxExecutorBindEX(handle: SymbolHandle,
+                              deviceTypeId: Int,
+                              deviceID: Int,
+                              numCtx: Int,
+                              ctxMapKeys: Array[String],
+                              ctxMapDevTypes: Array[Int],
+                              ctxMapDevIDs: Array[Int],
+                              numArgs: Int,
+                              argsHandle: Array[NDArrayHandle],
+                              argsGradHandle: Array[NDArrayHandle],
+                              reqsArray: Array[Int],
+                              auxArgsHandle: Array[NDArrayHandle],
+                              sharedExec: ExecutorHandle,
+                              out: ExecutorHandleRef): Int
   // scalastyle:on parameterNum
   @native def mxSymbolSaveToFile(handle: SymbolHandle, fname: String): Int
   @native def mxSymbolCreateFromFile(fname: String, handle: SymbolHandleRef): Int
@@ -203,4 +230,50 @@ class LibInfo {
   @native def mxRandomSeed(seed: Int): Int
 
   @native def mxNotifyShutdown(): Int
+
+  // RecordIO
+  @native def mxRecordIOWriterCreate(uri: String, out: RecordIOHandleRef): Int
+  @native def mxRecordIOReaderCreate(uri: String, out: RecordIOHandleRef): Int
+  @native def mxRecordIOWriterFree(handle: RecordIOHandle): Int
+  @native def mxRecordIOReaderFree(handle: RecordIOHandle): Int
+  @native def mxRecordIOWriterWriteRecord(handle: RecordIOHandle, buf: String, size: Int): Int
+  @native def mxRecordIOReaderReadRecord(handle: RecordIOHandle, buf: RefString): Int
+  @native def mxRecordIOWriterTell(handle: RecordIOHandle, pos: RefInt): Int
+  @native def mxRecordIOReaderSeek(handle: RecordIOHandle, pos: Int): Int
+
+  @native def mxOptimizerFindCreator(key: String, out: OptimizerCreatorRef): Int
+  @native def mxOptimizerCreateOptimizer(creator: OptimizerCreator,
+                                         numParam: Int,
+                                         keys: Array[String],
+                                         vals: Array[String],
+                                         out: OptimizerHandleRef): Int
+  @native def mxOptimizerFree(handle: OptimizerHandle): Int
+  @native def mxOptimizerUpdate(handle: OptimizerHandle,
+                                index: Int,
+                                weight: NDArrayHandle,
+                                grad: NDArrayHandle,
+                                lr: Float,
+                                wd: Float): Int
+
+  // Rtc
+  @native def mxRtcCreate(name: String,
+                          inputNames: Array[String],
+                          outputNames: Array[String],
+                          inputs: Array[NDArrayHandle],
+                          outputs: Array[NDArrayHandle],
+                          kernel: String,
+                          out: RtcHandleRef): Int
+  @native def mxRtcPush(handle: RtcHandle,
+                        inputs: Array[NDArrayHandle],
+                        outputs: Array[NDArrayHandle],
+                        gridDimX: Int,
+                        gridDimY: Int,
+                        gridDimZ: Int,
+                        blockDimX: Int,
+                        blockDimY: Int,
+                        blockDimZ: Int): Int
+  @native def mxRtcFree(handle: RtcHandle): Int
+
+  // CustomOp
+  @native def mxCustomOpRegister(regName: String, opProp: CustomOpProp): Int
 }

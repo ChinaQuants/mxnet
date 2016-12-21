@@ -1,7 +1,8 @@
 # coding: utf-8
-# pylint: disable= too-many-lines, redefined-builtin
+# pylint: disable= too-many-lines, redefined-builtin, protected-access
 """NDArray API of mxnet."""
 from __future__ import absolute_import
+from __future__ import division
 
 import ctypes
 import warnings
@@ -10,12 +11,14 @@ import functools
 import operator
 import numpy as np
 from .base import _LIB, string_types, numeric_types
-from .base import c_array, py_str, c_str, mx_real_t
-from .base import mx_uint, mx_float, NDArrayHandle, FunctionHandle
+from .base import c_array, mx_float, py_str, c_str, mx_real_t
+from .base import mx_uint, NDArrayHandle, FunctionHandle
 from .base import ctypes2buffer
 from .base import check_call, ctypes2docstring
 from .context import Context
+from . import _ndarray_internal as _internal
 
+# pylint: disable= no-member
 _DTYPE_NP_TO_MX = {
     np.float32 : 0,
     np.float64 : 1,
@@ -31,6 +34,7 @@ _DTYPE_MX_TO_NP = {
     3 : np.uint8,
     4 : np.int32
 }
+# pylint: enable= no-member
 
 def _new_empty_handle():
     """Return a new empty handle.
@@ -90,6 +94,11 @@ class NDArray(object):
         self.handle = handle
         self.writable = writable
 
+    def __repr__(self):
+        shape_info = 'x'.join(['%d' % x for x in self.shape])
+        return '<%s %s @%s>' % (self.__class__.__name__,
+                                shape_info, self.context)
+
     def __del__(self):
         check_call(_LIB.MXNDArrayFree(self.handle))
 
@@ -100,9 +109,9 @@ class NDArray(object):
         if not self.writable:
             raise ValueError('trying to add to a readonly NDArray')
         if isinstance(other, NDArray):
-            return NDArray._plus(self, other, out=self)
+            return _internal._plus(self, other, out=self)
         elif isinstance(other, numeric_types):
-            return NDArray._plus_scalar(self, float(other), out=self)
+            return _internal._plus_scalar(self, float(other), out=self)
         else:
             raise TypeError('type %s not supported' % str(type(other)))
 
@@ -116,9 +125,9 @@ class NDArray(object):
         if not self.writable:
             raise ValueError('trying to subtract from a readonly NDArray')
         if isinstance(other, NDArray):
-            return NDArray._minus(self, other, out=self)
+            return _internal._minus(self, other, out=self)
         elif isinstance(other, numeric_types):
-            return NDArray._minus_scalar(self, float(other), out=self)
+            return _internal._minus_scalar(self, float(other), out=self)
         else:
             raise TypeError('type %s not supported' % str(type(other)))
 
@@ -129,15 +138,15 @@ class NDArray(object):
         return multiply(self, other)
 
     def __neg__(self):
-        return NDArray._mul_scalar(self, -1.0)
+        return _internal._mul_scalar(self, -1.0)
 
     def __imul__(self, other):
         if not self.writable:
             raise ValueError('trying to multiply to a readonly NDArray')
         if isinstance(other, NDArray):
-            return NDArray._mul(self, other, out=self)
+            return _internal._mul(self, other, out=self)
         elif isinstance(other, numeric_types):
-            return NDArray._mul_scalar(self, float(other), out=self)
+            return _internal._mul_scalar(self, float(other), out=self)
         else:
             raise TypeError('type %s not supported' % str(type(other)))
 
@@ -154,14 +163,26 @@ class NDArray(object):
         if not self.writable:
             raise ValueError('trying to divide from a readonly NDArray')
         if isinstance(other, NDArray):
-            return NDArray._div(self, other, out=self)
+            return _internal._div(self, other, out=self)
         elif isinstance(other, numeric_types):
-            return NDArray._div_scalar(self, float(other), out=self)
+            return _internal._div_scalar(self, float(other), out=self)
         else:
             raise TypeError('type %s not supported' % str(type(other)))
 
     def __truediv__(self, other):
-        return self.__div__(other)
+        return divide(self, other)
+
+    def __rtruediv__(self, other):
+        return divide(other, self)
+
+    def __itruediv__(self, other):
+        return self.__idiv__(other)
+
+    def __pow__(self, other):
+        return power(self, other)
+
+    def __rpow__(self, other):
+        return power(other, self)
 
     def __getstate__(self):
         this = self.__dict__.copy()
@@ -187,27 +208,88 @@ class NDArray(object):
         self.__dict__.update(state)
 
     def __setitem__(self, in_slice, value):
-        """Set ndarray value"""
+        """Set ndarray value.
+
+        `value` can be a scalar, an `NDArray` or numpy array of compatible shape.
+        The following modes are supported:
+
+        - `array[:] = value`: set all the contents
+        - `array[i] = value`: set the i-th slice. If the array is of dimension
+          `(d1, d2, d3)`, it sets value of a slice of shape `(1, d2, d3)`.
+        - `array[i:j] = value`: similarly, if the array is of dimension
+          `(d1, d2, d3)`, it sets value of a slice of shape `(j-i, d2, d3)`.
+
+        Fully-dimensional indexing is also supported. For example, if array is
+        of shape `(d1, d2, d3)`, one can do
+
+        - `array[:, :, :] = value`: achieving the same effect of `array[:] = value`
+        - `array[:, i, j:k] = value`: each index could be a python slice or an int.
+        """
+        # pylint: disable=too-many-branches
         if not self.writable:
             raise ValueError('trying to assign to a readonly NDArray')
-        if not isinstance(in_slice, slice) or in_slice.step is not None:
-            raise ValueError('NDArray only support continuous slicing on axis 0')
-        if in_slice.start is not None or in_slice.stop is not None:
-            sliced_arr = self._slice(in_slice.start, in_slice.stop)
+        if isinstance(in_slice, int):
+            sliced_arr = self._at(in_slice)
             sliced_arr[:] = value
             return
-        if isinstance(value, NDArray):
-            if value.handle is not self.handle:
-                value.copyto(self)
-        elif isinstance(value, numeric_types):
-            NDArray._set_value(float(value), out=self)
-        elif isinstance(value, (np.ndarray, np.generic)):
-            self._sync_copyfrom(value)
-        else:
-            raise TypeError('type %s not supported' % str(type(value)))
+        if isinstance(in_slice, slice):
+            if in_slice.step is not None:
+                raise ValueError('NDArray only support continuous slicing on axis 0')
+            if in_slice.start is not None or in_slice.stop is not None:
+                sliced_arr = self._slice(in_slice.start, in_slice.stop)
+                sliced_arr[:] = value
+                return
+            if isinstance(value, NDArray):
+                if value.handle is not self.handle:
+                    value.copyto(self)
+            elif isinstance(value, numeric_types):
+                _internal._set_value(float(value), out=self)
+            elif isinstance(value, (np.ndarray, np.generic)):
+                self._sync_copyfrom(value)
+            else:
+                raise TypeError('type %s not supported' % str(type(value)))
+        if isinstance(in_slice, tuple):
+            # multi-dimension indexing
+            my_shape = self.shape
+            assert len(in_slice) == len(my_shape)
+            for slice_i in in_slice:
+                assert isinstance(slice_i, (slice, int))
+            begin = [0 for _ in my_shape]
+            end = [x for x in my_shape]
+            for i, slice_i in enumerate(in_slice):
+                if isinstance(slice_i, int):
+                    assert slice_i < my_shape[i]
+                    begin[i] = slice_i
+                    end[i] = slice_i + 1
+                if isinstance(slice_i, slice):
+                    # only support continuous slicing
+                    assert slice_i.step is None
+                    begin[i] = slice_i.start or 0
+                    end[i] = slice_i.stop or my_shape[i]
+                    assert begin[i] < end[i]
+                    assert end[i] <= my_shape[i]
+            begin = tuple(begin)
+            end = tuple(end)
+            if isinstance(value, NDArray):
+                value = value.as_in_context(self.context)
+                _internal._crop_assign(self, value, out=self,
+                                       begin=begin, end=end)
+            elif isinstance(value, numeric_types):
+                _internal._crop_assign_scalar(self, out=self,
+                                              begin=begin, end=end,
+                                              scalar=value)
+            elif isinstance(value, (np.ndarray, np.generic)):
+                value = array(value, ctx=self.context)
+                _internal._crop_assign(self, value, out=self,
+                                       begin=begin, end=end)
+            else:
+                raise TypeError('type %s not supported' % str(type(value)))
+        # pylint: enable=too-many-branches
 
     def __getitem__(self, in_slice):
         """Get ndarray"""
+        if isinstance(in_slice, int):
+            return self._at(in_slice)
         if not isinstance(in_slice, slice) or in_slice.step is not None:
             raise ValueError('NDArray only support continuous slicing on axis 0')
         if in_slice.start is not None or in_slice.stop is not None:
@@ -231,7 +313,8 @@ class NDArray(object):
                                 'type %s is not supported' % str(type(array)))
         source_array = np.ascontiguousarray(source_array, dtype=self.dtype)
         if source_array.shape != self.shape:
-            raise ValueError('array shape do not match the shape of NDArray')
+            raise ValueError('Shape inconsistant: expected %s vs got %s'%(
+                str(self.shape), str(source_array.shape)))
         check_call(_LIB.MXNDArraySyncCopyFromCPU(
             self.handle,
             source_array.ctypes.data_as(ctypes.c_void_p),
@@ -254,6 +337,20 @@ class NDArray(object):
             self.handle, start, stop, ctypes.byref(handle)))
         return NDArray(handle=handle, writable=self.writable)
 
+    def _at(self, idx):
+        """Return a sub NDArray that shares memory with current one.
+
+        Parameters
+        ----------
+        idx : int
+            index of sub array.
+        """
+        handle = NDArrayHandle()
+        idx = mx_uint(idx)
+        check_call(_LIB.MXNDArrayAt(
+            self.handle, idx, ctypes.byref(handle)))
+        return NDArray(handle=handle, writable=self.writable)
+
     def reshape(self, new_shape):
         """Return a reshaped NDArray that shares memory with current one.
 
@@ -269,6 +366,7 @@ class NDArray(object):
                                          ctypes.byref(handle)))
         return NDArray(handle=handle, writable=self.writable)
 
+    # pylint: disable= undefined-variable
     def broadcast_to(self, shape):
         """ Broadcasting the current NDArray into the given shape. The semantics is
         the same with `numpy`'s broadcasting
@@ -276,22 +374,23 @@ class NDArray(object):
         Parameters
         ---------
         shape : the shape to broadcast
-            the braodcast shape
+            the broadcast shape
         """
         cur_shape = self.shape
-        err_str = 'operands could not be broadcast together with remapped shapes'\
-                '[original->remapped]: {} and requested shape {}'.format(cur_shape, shape)
+        err_str = 'operands could not be broadcast together with remapped shapes' \
+                  '[original->remapped]: {} and requested shape {}'.format(cur_shape, shape)
         if len(shape) < len(cur_shape):
             raise ValueError(err_str)
         cur_shape = (1,) * (len(shape) - len(cur_shape)) + cur_shape
-        for i, j in zip(cur_shape, shape):
-            if i != 1 and i != j:
-                raise ValueError(err_str)
-        ret = self.reshape(cur_shape)
-        for axis, (i, j) in enumerate(zip(cur_shape, shape)):
-            if i != j:
-                ret = NDArray._broadcast(ret, axis, j)
-        return ret
+        cur_shape_arr = np.array(cur_shape)
+        broadcasting_axes = np.nonzero(cur_shape_arr != np.array(shape))
+        if (cur_shape_arr[broadcasting_axes] != 1).any():
+            raise ValueError(err_str)
+        if cur_shape != self.shape:
+            return broadcast_to(self.reshape(cur_shape), shape=shape)
+        else:
+            return broadcast_to(self, shape=tuple(shape))
+    # pylint: enable= undefined-variable
 
     def wait_to_read(self):
         """Block until all pending writes operations on current NDArray are finished.
@@ -431,10 +530,10 @@ class NDArray(object):
                 warnings.warn('copy an array to itself, is it intended?',
                               RuntimeWarning)
                 return
-            return NDArray._copyto(self, out=other)
+            return _internal._copyto(self, out=other)
         elif isinstance(other, Context):
             hret = NDArray(_new_alloc_handle(self.shape, other, True, self.dtype))
-            return NDArray._copyto(self, out=hret)
+            return _internal._copyto(self, out=hret)
         else:
             raise TypeError('copyto do not support type ' + str(type(other)))
 
@@ -486,7 +585,7 @@ def onehot_encode(indices, out):
         Same as out.
     """
     # pylint: disable= no-member, protected-access
-    return NDArray._onehot_encode(indices, out, out=out)
+    return _internal._onehot_encode(indices, out, out=out)
     # pylint: enable= no-member, protected-access
 
 
@@ -512,6 +611,61 @@ def empty(shape, ctx=None, dtype=mx_real_t):
         ctx = Context.default_ctx
     return NDArray(handle=_new_alloc_handle(shape, ctx, False, dtype))
 
+#pylint: disable= too-many-arguments, no-member, protected-access
+def _ufunc_helper(lhs, rhs, fn_array, fn_scalar, lfn_scalar, rfn_scalar=None):
+    """ Helper function for element-wise operation
+    The function will perform numpy-like broadcasting if needed and call different functions
+
+    Parameters
+    ----------
+    lhs : NDArray or numeric value
+        left hande side operand
+
+    rhs : NDArray or numeric value
+        right hand side operand
+
+    fn_array : function
+        function to be called if both lhs and rhs are of NDArray type
+
+    fn_scalar : function
+        function to be called if both lhs and rhs are numeric values
+
+    lfn_scalar : function
+        function to be called if lhs is NDArray while rhs is numeric value
+
+    rfn_scalar : function
+        function to be called if lhs is numeric value while rhs is NDArray;
+        if none is provided, then the function is commutative, so rfn_scalar is equal to lfn_scalar
+
+    Returns
+    -------
+    out: NDArray
+        result array
+    """
+    if isinstance(lhs, numeric_types):
+        if isinstance(rhs, numeric_types):
+            return fn_scalar(lhs, rhs)
+        else:
+            if rfn_scalar is None:
+                # commutative function
+                return lfn_scalar(rhs, float(lhs))
+            else:
+                return rfn_scalar(rhs, float(lhs))
+    elif isinstance(rhs, numeric_types):
+        return lfn_scalar(lhs, float(rhs))
+    elif isinstance(rhs, NDArray):
+        # check whether broadcasting is needed
+        lsize = functools.reduce(operator.mul, lhs.shape)
+        rsize = functools.reduce(operator.mul, rhs.shape)
+        if lsize < rsize:
+            lhs = lhs.broadcast_to(rhs.shape)
+        elif lsize > rsize:
+            rhs = rhs.broadcast_to(lhs.shape)
+        return fn_array(lhs, rhs)
+    else:
+        raise TypeError('type %s not supported' % str(type(rhs)))
+#pylint: enable= too-many-arguments, no-member, protected-access
+
 def add(lhs, rhs):
     """ Perform element-wise addition
 
@@ -529,23 +683,13 @@ def add(lhs, rhs):
         result array
     """
     # pylint: disable= no-member, protected-access
-    if isinstance(lhs, numeric_types):
-        if isinstance(rhs, numeric_types):
-            return lhs + rhs
-        else:
-            return add(rhs, lhs)
-    elif isinstance(rhs, numeric_types):
-        return NDArray._plus_scalar(lhs, float(rhs))
-    elif isinstance(rhs, NDArray):
-        lsize = functools.reduce(operator.mul, lhs.shape)
-        rsize = functools.reduce(operator.mul, rhs.shape)
-        if lsize < rsize:
-            lhs = lhs.broadcast_to(rhs.shape)
-        elif lsize > rsize:
-            rhs = rhs.broadcast_to(lhs.shape)
-        return NDArray._plus(lhs, rhs)
-    else:
-        raise TypeError('type %s not supported' % str(type(rhs)))
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._plus,
+        operator.add,
+        _internal._plus_scalar,
+        None)
     # pylint: enable= no-member, protected-access
 
 def subtract(lhs, rhs):
@@ -565,25 +709,13 @@ def subtract(lhs, rhs):
         result array
     """
     # pylint: disable= no-member, protected-access
-    if isinstance(lhs, numeric_types):
-        if isinstance(rhs, numeric_types):
-            return lhs - rhs
-        elif isinstance(rhs, NDArray):
-            return NDArray._rminus_scalar(rhs, float(lhs))
-        else:
-            raise TypeError('type %s not supported' % str(type(rhs)))
-    elif isinstance(rhs, numeric_types):
-        return NDArray._minus_scalar(lhs, float(rhs))
-    elif isinstance(rhs, NDArray):
-        lsize = functools.reduce(operator.mul, lhs.shape)
-        rsize = functools.reduce(operator.mul, rhs.shape)
-        if lsize < rsize:
-            lhs = lhs.broadcast_to(rhs.shape)
-        elif lsize > rsize:
-            rhs = rhs.broadcast_to(lhs.shape)
-        return NDArray._minus(lhs, rhs)
-    else:
-        raise TypeError('type %s not supported' % str(type(rhs)))
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._minus,
+        operator.sub,
+        _internal._minus_scalar,
+        _internal._rminus_scalar)
     # pylint: enable= no-member, protected-access
 
 def multiply(lhs, rhs):
@@ -603,23 +735,13 @@ def multiply(lhs, rhs):
         result array
     """
     # pylint: disable= no-member, protected-access
-    if isinstance(lhs, numeric_types):
-        if isinstance(rhs, numeric_types):
-            return lhs * rhs
-        else:
-            return multiply(rhs, lhs)
-    elif isinstance(rhs, numeric_types):
-        return NDArray._mul_scalar(lhs, float(rhs))
-    elif isinstance(rhs, NDArray):
-        lsize = functools.reduce(operator.mul, lhs.shape)
-        rsize = functools.reduce(operator.mul, rhs.shape)
-        if lsize < rsize:
-            lhs = lhs.broadcast_to(rhs.shape)
-        elif lsize > rsize:
-            rhs = rhs.broadcast_to(lhs.shape)
-        return NDArray._mul(lhs, rhs)
-    else:
-        raise TypeError('type %s not supported' % str(type(rhs)))
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._mul,
+        operator.mul,
+        _internal._mul_scalar,
+        None)
     # pylint: enable= no-member, protected-access
 
 def divide(lhs, rhs):
@@ -639,25 +761,91 @@ def divide(lhs, rhs):
         result array
     """
     # pylint: disable= no-member, protected-access
-    if isinstance(lhs, numeric_types):
-        if isinstance(rhs, numeric_types):
-            return lhs / rhs
-        elif isinstance(rhs, NDArray):
-            return NDArray._rdiv_scalar(rhs, float(lhs))
-        else:
-            raise TypeError('type %s not supported' % str(type(rhs)))
-    elif isinstance(rhs, numeric_types):
-        return NDArray._div_scalar(lhs, float(rhs))
-    elif isinstance(rhs, NDArray):
-        lsize = functools.reduce(operator.mul, lhs.shape)
-        rsize = functools.reduce(operator.mul, rhs.shape)
-        if lsize < rsize:
-            lhs = lhs.broadcast_to(rhs.shape)
-        elif lsize > rsize:
-            rhs = rhs.broadcast_to(lhs.shape)
-        return NDArray._div(lhs, rhs)
-    else:
-        raise TypeError('type %s not supported' % str(type(rhs)))
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._div,
+        operator.truediv,
+        _internal._div_scalar,
+        _internal._rdiv_scalar)
+    # pylint: enable= no-member, protected-access
+
+def power(lhs, rhs):
+    """ Perform power operator
+
+    Parameters
+    ----------
+    lhs : Array or float value
+        left hand side operand
+
+    rhs : Array of float value
+        right hand side operand
+
+    Returns
+    -------
+    out: Array
+        result array
+    """
+    # pylint: disable= no-member, protected-access
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._power,
+        operator.pow,
+        _internal._power_scalar,
+        _internal._rpower_scalar)
+    # pylint: enable= no-member, protected-access
+
+def maximum(lhs, rhs):
+    """ Perform maximum operator
+
+    Parameters
+    ----------
+    lhs : Array or float value
+        left hand side operand
+
+    rhs : Array of float value
+        right hand side operand
+
+    Returns
+    -------
+    out: Array
+        result array
+    """
+    # pylint: disable= no-member, protected-access
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._maximum,
+        lambda x, y: x if x > y else y,
+        _internal._maximum_scalar,
+        None)
+    # pylint: enable= no-member, protected-access
+
+def minimum(lhs, rhs):
+    """ Perform minimum operator
+
+    Parameters
+    ----------
+    lhs : Array or float value
+        left hand side operand
+
+    rhs : Array of float value
+        right hand side operand
+
+    Returns
+    -------
+    out: Array
+        result array
+    """
+    # pylint: disable= no-member, protected-access
+    return _ufunc_helper(
+        lhs,
+        rhs,
+        _internal._minimum,
+        lambda x, y: x if x < y else y,
+        _internal._minimum_scalar,
+        None)
     # pylint: enable= no-member, protected-access
 
 def true_divide(lhs, rhs):
@@ -708,79 +896,6 @@ def ones(shape, ctx=None, dtype=mx_real_t):
     arr[:] = 1.0
     return arr
 
-# pylint: disable=too-many-locals, invalid-name, no-member, protected-access, undefined-variable
-def sum(arr, axis=None, keepdims=False):
-    """ Reduce the array along given axises. The semantic strictly follows numpy's document.
-
-    Parameters
-    ----------
-    arr : Array
-        the array to be reduced
-    axis : int or list(int), optional
-        along which axis to do reduction
-    keepdims : bool
-        whether the reduced axis should be kept in the final shape
-
-    Returns
-    -------
-    out: Array
-        The reduced NDArray.
-    """
-    # Sanity checks.
-    ndim = len(arr.shape)
-    if axis is None:
-        axis = list(range(ndim))
-    elif isinstance(axis, int):
-        axis = [axis]
-    elif isinstance(axis, tuple):
-        axis = list(axis)
-    else:
-        raise TypeError('\'%s\' object cannot be interpreted as an integer' % type(axis).__name__)
-    for i in axis:
-        if not isinstance(i, int):
-            raise TypeError('\'%s\' object cannot be interpreted as an integer' % type(i).__name__)
-    axis = sorted([x if 0 <= x else x + ndim for x in axis])
-    for i in axis:
-        if i < 0 or ndim <= i:
-            raise ValueError('\'axis\' entry is out of bounds')
-    if len(set(axis)) != len(axis):
-        raise ValueError('duplicate value in \'axis\'')
-    assert(len(axis) != 0)
-
-    def get_ranges(lst):
-        """ Get consecutive ranges. """
-        i = 0
-        j = 0
-        ret = []
-        while j < len(lst) - 1:
-            if lst[j] + 1 != lst[j + 1]:
-                ret.append((lst[i], lst[j]))
-                i = j + 1
-            j += 1
-        ret.append((lst[i], lst[j]))
-        return ret
-
-    # Reduction.
-    shape = arr.shape
-    ret = arr
-    for i in reversed(get_ranges(axis)):
-        after_dim = shape[i[1] + 1:]
-        after = functools.reduce(operator.mul, after_dim, 1)
-        before_dim = shape[:i[0]]
-        before = functools.reduce(operator.mul, before_dim, 1)
-        between = functools.reduce(operator.mul, shape[i[0]:i[1] + 1], 1)
-        interval = i[1] - i[0] + 1
-        shape = before_dim + tuple([1] * (interval if keepdims else 0)) + after_dim
-        reduction_shape = (before, between, after)
-        ret = ret.reshape(reduction_shape)
-        ret = sum_mid_internal(ret)
-        if len(shape) == 0:
-            ret = ret.reshape((1,)).asnumpy()[0]
-        else:
-            ret = ret.reshape(shape)
-    return ret
-# pylint: enable=too-many-locals, invalid-name, no-member, protected-access, undefined-variable
-
 def full(shape, val, ctx=None):
     """Create a new NDArray filled with given value, with specified shape.
 
@@ -828,7 +943,7 @@ def array(source_array, ctx=None, dtype=mx_real_t):
     arr[:] = source_array
     return arr
 
-def concatenate(arrays, always_copy=True):
+def concatenate(arrays, axis=0, always_copy=True):
     """Concatenate a list of NDArrays along the first dimension.
 
     Parameters
@@ -836,6 +951,8 @@ def concatenate(arrays, always_copy=True):
     arrays : list of NDArray
         Arrays to be concatenate. They must have identical shape except
         the first dimension. They also must have the same data type.
+    axis : int
+        The axis along which to concatenate.
     always_copy : bool
         Default `True`. When not `True`, if the arrays only contain one
         `NDArray`, that element will be returned directly, avoid copying.
@@ -851,18 +968,33 @@ def concatenate(arrays, always_copy=True):
     if not always_copy and len(arrays) == 1:
         return arrays[0]
 
-    shape0 = arrays[0].shape[0]
-    shape_rest = arrays[0].shape[1:]
+    shape_axis = arrays[0].shape[axis]
+    shape_rest1 = arrays[0].shape[0:axis]
+    shape_rest2 = arrays[0].shape[axis+1:]
     dtype = arrays[0].dtype
     for arr in arrays[1:]:
-        shape0 += arr.shape[0]
-        assert shape_rest == arr.shape[1:]
+        shape_axis += arr.shape[axis]
+        assert shape_rest1 == arr.shape[0:axis]
+        assert shape_rest2 == arr.shape[axis+1:]
         assert dtype == arr.dtype
-    ret = empty((shape0,) + shape_rest, ctx=arrays[0].context, dtype=dtype)
+    ret_shape = shape_rest1 + (shape_axis,) + shape_rest2
+    ret = empty(ret_shape, ctx=arrays[0].context, dtype=dtype)
+
     idx = 0
+    begin = [0 for _ in ret_shape]
+    end = list(ret_shape)
     for arr in arrays:
-        ret[idx:idx+arr.shape[0]] = arr
-        idx += arr.shape[0]
+        if axis == 0:
+            ret[idx:idx+arr.shape[0]] = arr
+        else:
+            begin[axis] = idx
+            end[axis] = idx+arr.shape[axis]
+            # pylint: disable=no-member,protected-access
+            _internal._crop_assign(ret, arr, out=ret,
+                                   begin=tuple(begin),
+                                   end=tuple(end))
+            # pylint: enable=no-member,protected-access
+        idx += arr.shape[axis]
 
     return ret
 
@@ -967,30 +1099,30 @@ def imdecode(str_img, clip_rect=(0, 0, 0, 0), out=None, index=0, channels=3, mea
     channels : int
         number of channels to output. Decode to grey scale when channels = 1.
     mean : NDArray
-        substract mean from decode image before outputing.
+        subtract mean from decode image before outputing.
     """
     # pylint: disable= no-member, protected-access, too-many-arguments
     if mean is None:
         mean = NDArray(_new_empty_handle())
     if out is None:
-        return NDArray._imdecode(mean, index,
-                                 clip_rect[0],
-                                 clip_rect[1],
-                                 clip_rect[2],
-                                 clip_rect[3],
-                                 channels,
-                                 len(str_img),
-                                 str_img=str_img)
+        return _internal._imdecode(mean, index,
+                                   clip_rect[0],
+                                   clip_rect[1],
+                                   clip_rect[2],
+                                   clip_rect[3],
+                                   channels,
+                                   len(str_img),
+                                   str_img=str_img)
     else:
-        return NDArray._imdecode(mean, index,
-                                 clip_rect[0],
-                                 clip_rect[1],
-                                 clip_rect[2],
-                                 clip_rect[3],
-                                 channels,
-                                 len(str_img),
-                                 str_img=str_img,
-                                 out=out)
+        return _internal._imdecode(mean, index,
+                                   clip_rect[0],
+                                   clip_rect[1],
+                                   clip_rect[2],
+                                   clip_rect[3],
+                                   channels,
+                                   len(str_img),
+                                   str_img=str_img,
+                                   out=out)
 
 # pylint: disable=too-many-locals, invalid-name
 def _make_ndarray_function(handle):
@@ -1050,11 +1182,11 @@ def _make_ndarray_function(handle):
     doc_str = doc_str % (py_str(desc.value), param_str)
 
     # Definition of internal functions.
-    def binary_ndarray_function(lhs, rhs, out=None):
+    def binary_ndarray_function(lhs, rhs, out=None, **kwargs):
         """Internal binary function
         """
         if out:
-            if isinstance(out, NDArray) == False:
+            if not isinstance(out, NDArray):
                 raise TypeError('out must be NDArray')
             if not out.writable:
                 raise TypeError('out must be writable')
@@ -1062,19 +1194,20 @@ def _make_ndarray_function(handle):
             if not accept_empty_mutate:
                 raise TypeError('argument out is required to call %s' % func_name)
             out = NDArray(_new_empty_handle())
-        check_call(_LIB.MXFuncInvokeEx(handle,
-                                       c_array(NDArrayHandle, (lhs.handle, rhs.handle)),
-                                       c_array(mx_float, ()),
-                                       c_array(NDArrayHandle, (out.handle,)),
-                                       ctypes.c_int(0),
-                                       c_array(ctypes.c_char_p, []),
-                                       c_array(ctypes.c_char_p, [])))
+        check_call(_LIB.MXFuncInvokeEx( \
+                handle, \
+                c_array(NDArrayHandle, (lhs.handle, rhs.handle)), \
+                c_array(mx_float, ()), \
+                c_array(NDArrayHandle, (out.handle,)), \
+                ctypes.c_int(len(kwargs)), \
+                c_array(ctypes.c_char_p, [c_str(key) for key in kwargs.keys()]), \
+                c_array(ctypes.c_char_p, [c_str(str(i)) for i in kwargs.values()])))
         return out
 
-    def unary_ndarray_function(src, out=None):
+    def unary_ndarray_function(src, out=None, *args, **kwargs):
         """internal NDArray function"""
         if out:
-            if isinstance(out, NDArray) == False:
+            if not isinstance(out, NDArray):
                 raise TypeError('out must be NDArray')
             if not out.writable:
                 raise TypeError('out must be writable')
@@ -1085,11 +1218,11 @@ def _make_ndarray_function(handle):
         check_call(_LIB.MXFuncInvokeEx( \
                 handle, \
                 c_array(NDArrayHandle, (src.handle,)), \
-                c_array(mx_float, ()), \
+                c_array(mx_float, [args[i] for i in scalar_range]), \
                 c_array(NDArrayHandle, (out.handle,)), \
-                ctypes.c_int(0), \
-                c_array(ctypes.c_char_p, []), \
-                c_array(ctypes.c_char_p, [])))
+                ctypes.c_int(len(kwargs)), \
+                c_array(ctypes.c_char_p, [c_str(key) for key in kwargs.keys()]), \
+                c_array(ctypes.c_char_p, [c_str(str(i)) for i in kwargs.values()])))
         return out
 
     def generic_ndarray_function(*args, **kwargs):
@@ -1121,13 +1254,13 @@ def _make_ndarray_function(handle):
             else:
                 raise TypeError('argument out is required to call %s' % func_name)
         check_call(_LIB.MXFuncInvokeEx( \
-                handle, \
-                c_array(NDArrayHandle, [args[i].handle for i in use_vars_range]), \
-                c_array(mx_float, [args[i] for i in scalar_range]), \
-                c_array(NDArrayHandle, [v.handle for v in mutate_vars]), \
-                ctypes.c_int(len(kwargs)), \
-                c_array(ctypes.c_char_p, kwargs.keys()), \
-                c_array(ctypes.c_char_p, [str(i) for i in kwargs.values()])))
+            handle, \
+            c_array(NDArrayHandle, [args[i].handle for i in use_vars_range]), \
+            c_array(mx_float, [args[i] for i in scalar_range]), \
+            c_array(NDArrayHandle, [v.handle for v in mutate_vars]), \
+            ctypes.c_int(len(kwargs)), \
+            c_array(ctypes.c_char_p, [c_str(key) for key in kwargs.keys()]), \
+            c_array(ctypes.c_char_p, [c_str(str(i)) for i in kwargs.values()])))
         if n_mutate_vars == 1:
             return mutate_vars[0]
         else:
@@ -1155,12 +1288,13 @@ def _init_ndarray_module():
                                     ctypes.byref(plist)))
 
     module_obj = sys.modules[__name__]
+    module_internal = sys.modules["mxnet._ndarray_internal"]
     for i in range(size.value):
         hdl = FunctionHandle(plist[i])
         function = _make_ndarray_function(hdl)
-        # if function name starts with underscore, register as static method of NDArray
+        # if function name starts with underscore, register as internal namespace
         if function.__name__.startswith('_'):
-            setattr(NDArray, function.__name__, staticmethod(function))
+            setattr(module_internal, function.__name__, function)
         else:
             fname = function.__name__
             fn_obj = getattr(module_obj, fname, None)

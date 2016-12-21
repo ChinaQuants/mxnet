@@ -31,7 +31,8 @@ namespace mxnet {
 class NDArray {
  public:
   /*! \brief default cosntructor */
-  NDArray() {}
+  NDArray() {
+  }
   /*!
    * \brief constructing a new dynamic NDArray
    * \param shape the shape of array
@@ -65,11 +66,25 @@ class NDArray {
    * \return the data TBlob
    */
   inline TBlob data() const {
+    TBlob res;
     MSHADOW_TYPE_SWITCH(dtype_, DType, {
-      return TBlob(static_cast<DType*>(ptr_->shandle.dptr)
+      res = TBlob(static_cast<DType*>(ptr_->shandle.dptr)
         + offset_, shape_, ptr_->shandle.ctx.dev_mask());
     });
-    return TBlob();
+    return res;
+  }
+  /*!
+   * \return a chunk of raw data in TBlob
+   */
+  inline TBlob raw_data(index_t offset, index_t length) const {
+    TBlob res;
+    TShape raw_shape(1);
+    raw_shape[0] = length;
+    MSHADOW_TYPE_SWITCH(dtype_, DType, {
+      res = TBlob(static_cast<DType*>(ptr_->shandle.dptr)
+        + offset_ + offset, raw_shape, ptr_->shandle.ctx.dev_mask());
+    });
+    return res;
   }
   /*!
    * \return the context of NDArray, this function is only valid when the NDArray is not empty
@@ -146,42 +161,42 @@ class NDArray {
   /*!
    * \brief elementwise subtract from current ndarray
    * this mutate the current NDArray
-   * \param src the data to substract
+   * \param src the data to subtract
    * \return reference of self
    */
   NDArray &operator-=(const NDArray &src);
   /*!
    * \brief elementwise subtract from current ndarray
    * this mutate the current NDArray
-   * \param src the data to substract
+   * \param src the data to subtract
    * \return reference of self
    */
   NDArray &operator-=(const real_t &src);
   /*!
    * \brief elementwise multiplication to current ndarray
    *  this mutate the current NDArray
-   * \param src the data to substract
+   * \param src the data to subtract
    * \return reference of self
    */
   NDArray &operator*=(const NDArray &src);
   /*!
    * \brief elementwise multiplication to current ndarray
    *  this mutate the current NDArray
-   * \param src the data to substract
+   * \param src the data to subtract
    * \return reference of self
    */
   NDArray &operator*=(const real_t &src);
   /*!
    * \brief elementwise division from current ndarray
    *  this mutate the current NDArray
-   * \param src the data to substract
+   * \param src the data to subtract
    * \return reference of self
    */
   NDArray &operator/=(const NDArray &src);
   /*!
    * \brief elementwise division from current ndarray
    *  this mutate the current NDArray
-   * \param src the data to substract
+   * \param src the data to subtract
    * \return reference of self
    */
   NDArray &operator/=(const real_t &src);
@@ -228,12 +243,23 @@ class NDArray {
     NDArray ret = *this;
     CHECK(!is_none()) << "NDArray is not initialized";
     CHECK_GE(shape_[0], end) << "Slice end index out of range";
-    size_t length = 1;
-    for (index_t i = 1; i < shape_.ndim(); ++i) {
-      length *= shape_[i];
-    }
+    size_t length = shape_.ProdShape(1, shape_.ndim());
     ret.offset_ += begin * length;
     ret.shape_[0] = end - begin;
+    return ret;
+  }
+  /*!
+   * \brief Index a NDArray
+   * \param idx the index
+   * \return idx-th sub array NDArray
+   */
+  inline NDArray At(index_t idx) const {
+    NDArray ret = *this;
+    CHECK(!is_none()) << "NDArray is not initialized";
+    CHECK_GE(shape_[0], idx) << "index out of range";
+    size_t length = shape_.ProdShape(1, shape_.ndim());
+    ret.offset_ += idx * length;
+    ret.shape_ = TShape(shape_.data()+1, shape_.data()+shape_.ndim());
     return ret;
   }
   /*!
@@ -333,6 +359,7 @@ class NDArray {
       }
     }
   };
+
   /*! \brief internal data of NDArray */
   std::shared_ptr<Chunk> ptr_;
   /*! \brief shape of current NDArray */
@@ -355,6 +382,7 @@ class NDArray {
  *     due to different possible convention carried by copy function.
  */
 void CopyFromTo(const NDArray &from, NDArray *to, int priority = 0);
+
 
 /*!
  * \brief Perform elementwise sum over each data from source, store result into out.
@@ -379,14 +407,14 @@ NDArray operator+(const NDArray &lhs, const NDArray &rhs);
  */
 NDArray operator+(const NDArray &lhs, const real_t &rhs);
 /*!
- * \brief elementwise substraction
+ * \brief elementwise subtraction
  * \param lhs left operand
  * \param rhs right operand
  * \return a new result ndarray
  */
 NDArray operator-(const NDArray &lhs, const NDArray &rhs);
 /*!
- * \brief elementwise substraction
+ * \brief elementwise subtraction
  * \param lhs left operand
  * \param rhs right operand
  * \return a new result ndarray

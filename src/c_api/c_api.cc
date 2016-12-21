@@ -282,6 +282,16 @@ int MXNDArraySlice(NDArrayHandle handle,
   API_END_HANDLE_ERROR(delete ptr);
 }
 
+int MXNDArrayAt(NDArrayHandle handle,
+                mx_uint idx,
+                NDArrayHandle *out) {
+  NDArray *ptr = new NDArray();
+  API_BEGIN();
+  *ptr = static_cast<NDArray*>(handle)->At(idx);
+  *out = ptr;
+  API_END_HANDLE_ERROR(delete ptr);
+}
+
 MXNET_DLL int MXNDArrayReshape(NDArrayHandle handle,
                                int ndim,
                                int *dims,
@@ -1282,6 +1292,13 @@ int MXKVStoreBarrier(KVStoreHandle handle) {
   API_END();
 }
 
+int MXKVStoreSetBarrierBeforeExit(KVStoreHandle handle,
+                                  const int barrier_before_exit) {
+  API_BEGIN();
+  static_cast<KVStore*>(handle)->set_barrier_before_exit(barrier_before_exit);
+  API_END();
+}
+
 int MXInitPSEnv(mx_uint num_vars,
                 const char **keys,
                 const char **vals) {
@@ -1341,6 +1358,15 @@ int MXKVStoreGetType(KVStoreHandle handle,
   API_END();
 }
 
+int MXKVStoreGetNumDeadNode(KVStoreHandle handle,
+                            const int node_id,
+                            int *number,
+                            const int timeout_sec) {
+  API_BEGIN();
+  *number = static_cast<KVStore*>(handle)->get_num_dead_node(node_id, timeout_sec);
+  API_END();
+}
+
 struct MXRecordIOContext {
   dmlc::RecordIOWriter *writer;
   dmlc::RecordIOReader *reader;
@@ -1370,12 +1396,20 @@ int MXRecordIOWriterFree(RecordIOHandle handle) {
   API_END();
 }
 
-int MXRecordIOWriterWriteRecord(RecordIOHandle *handle,
+int MXRecordIOWriterWriteRecord(RecordIOHandle handle,
                                 const char *buf, size_t size) {
   API_BEGIN();
   MXRecordIOContext *context =
     reinterpret_cast<MXRecordIOContext*>(handle);
   context->writer->WriteRecord(reinterpret_cast<const void*>(buf), size);
+  API_END();
+}
+
+int MXRecordIOWriterTell(RecordIOHandle handle, size_t *pos) {
+  API_BEGIN();
+  MXRecordIOContext *context =
+    reinterpret_cast<MXRecordIOContext*>(handle);
+  *pos = context->writer->Tell();
   API_END();
 }
 
@@ -1392,7 +1426,7 @@ int MXRecordIOReaderCreate(const char *uri,
   API_END();
 }
 
-int MXRecordIOReaderFree(RecordIOHandle *handle) {
+int MXRecordIOReaderFree(RecordIOHandle handle) {
   API_BEGIN();
   MXRecordIOContext *context =
     reinterpret_cast<MXRecordIOContext*>(handle);
@@ -1402,7 +1436,7 @@ int MXRecordIOReaderFree(RecordIOHandle *handle) {
   API_END();
 }
 
-int MXRecordIOReaderReadRecord(RecordIOHandle *handle,
+int MXRecordIOReaderReadRecord(RecordIOHandle handle,
                               char const **buf, size_t *size) {
   API_BEGIN();
   MXRecordIOContext *context =
@@ -1414,6 +1448,14 @@ int MXRecordIOReaderReadRecord(RecordIOHandle *handle,
     *buf = NULL;
     *size = 0;
   }
+  API_END();
+}
+
+int MXRecordIOReaderSeek(RecordIOHandle handle, size_t pos) {
+  API_BEGIN();
+  MXRecordIOContext *context =
+    reinterpret_cast<MXRecordIOContext*>(handle);
+  context->reader->Seek(pos);
   API_END();
 }
 

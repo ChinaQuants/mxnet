@@ -4,16 +4,43 @@
  * \brief elementwise sum operator
 */
 #include "./elementwise_sum-inl.h"
+#if MXNET_USE_MKL2017 == 1
+#include <mkl_memory.h>
+#include "./mkl/mkl_memory-inl.h"
+#include "./mkl/mkl_elementwise-inl.h"
+#endif  // MXNET_USE_MKL2017
+
 namespace mxnet {
 namespace op {
 template<>
-Operator* CreateOp<cpu>(ElementWiseSumParam param) {
-  return new ElementWiseSumOp<cpu>(param);
+Operator* CreateOp<cpu>(ElementWiseSumParam param, int dtype) {
+  Operator *op = NULL;
+#if MXNET_USE_MKL2017 == 1
+  switch (dtype) {
+  case mshadow::kFloat32:
+    return new MKLElementWiseOp<cpu, float>(param, EltwiseParameter_EltwiseOp_SUM);
+  case mshadow::kFloat64:
+    return new MKLElementWiseOp<cpu, double>(param, EltwiseParameter_EltwiseOp_SUM);
+  default:
+      LOG(INFO) << MKLElementWiseOp<cpu, float>::getName() << " Skip MKL optimization";
+      break;
+  }
+#endif
+  MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
+    op = new ElementWiseSumOp<cpu, DType>(param);
+  });
+
+  return op;
 }
 
 // DO_BIND_DISPATCH comes from static_operator_common.h
-Operator* ElementWiseSumProp::CreateOperator(Context ctx) const {
-  DO_BIND_DISPATCH(CreateOp, param_);
+Operator* ElementWiseSumProp::CreateOperatorEx(Context ctx, std::vector<TShape> *in_shape,
+                                               std::vector<int> *in_type) const {
+  std::vector<TShape> out_shape, aux_shape;
+  std::vector<int> out_type, aux_type;
+  CHECK(InferShape(in_shape, &out_shape, &aux_shape));
+  CHECK(InferType(in_type, &out_type, &aux_type));
+  DO_BIND_DISPATCH(CreateOp, param_, in_type->at(0));
 }
 
 DMLC_REGISTER_PARAMETER(ElementWiseSumParam);

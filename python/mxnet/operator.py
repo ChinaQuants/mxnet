@@ -3,13 +3,18 @@
 """numpy interface for operators."""
 from __future__ import absolute_import
 
+import traceback
+
+from threading import Lock
 from ctypes import CFUNCTYPE, POINTER, Structure, pointer
-from ctypes import c_void_p, cast, c_int, c_char, c_char_p, cast, c_bool
-c_int_p = POINTER(c_int)
+from ctypes import c_void_p, c_int, c_char, c_char_p, cast, c_bool
+
 from .base import _LIB, check_call
 from .base import c_array, c_str, mx_uint, mx_float, ctypes2numpy_shared, NDArrayHandle, py_str
 from . import symbol
 from .ndarray import NDArray
+
+c_int_p = POINTER(c_int)
 
 class PythonOp(object):
     """Base class for operators implemented in python
@@ -210,10 +215,10 @@ class NumpyOp(PythonOp):
                                  None, None, None, None, None)
         cb_ptr = format(cast(pointer(self.info_), c_void_p).value, 'x')
         # pylint: disable=E1101
-        sym = symbol.Symbol._Native(*args,
-                                    info=cb_ptr,
-                                    need_top_grad=self.need_top_grad(),
-                                    **kwargs)
+        sym = symbol._internal._Native(*args,
+                                       info=cb_ptr,
+                                       need_top_grad=self.need_top_grad(),
+                                       **kwargs)
         # keep a reference of ourself in PythonOp so we don't get garbage collected.
         PythonOp._ref_holder.append(self)
         return sym
@@ -265,8 +270,8 @@ class NDArrayOp(PythonOp):
                         tensors[tags[i]].append(NDArray(cast(ndarraies[i], NDArrayHandle),
                                                         writable=False))
                 self.forward(in_data=tensors[0], out_data=tensors[1])
-            except Exception as e:
-                print('Error in NDArrayOp.forward: ', str(e))
+            except Exception:
+                print('Error in NDArrayOp.forward: %s' % traceback.format_exc())
                 return False
             return True
 
@@ -283,8 +288,8 @@ class NDArrayOp(PythonOp):
                                                         writable=False))
                 self.backward(in_data=tensors[0], out_data=tensors[1],
                               in_grad=tensors[2], out_grad=tensors[3])
-            except Exception as e:
-                print('Error in NDArrayOp.backward: ', str(e))
+            except Exception:
+                print('Error in NDArrayOp.backward: %s' % traceback.format_exc())
                 return False
             return True
 
@@ -304,8 +309,8 @@ class NDArrayOp(PythonOp):
                 for i in range(n_in+n_out):
                     tensor_shapes[i] = cast(c_array(mx_uint, rshape[i]), POINTER(mx_uint))
                     tensor_dims[i] = len(rshape[i])
-            except Exception as e:
-                print('Error in NDArrayOp.infer_shape: ', str(e))
+            except Exception:
+                print('Error in NDArrayOp.infer_shape: %s' % traceback.format_exc())
                 return False
             return True
 
@@ -316,8 +321,8 @@ class NDArrayOp(PythonOp):
                 ret = [c_str(i) for i in ret] + [c_char_p(0)]
                 ret = c_array(c_char_p, ret)
                 out[0] = cast(ret, POINTER(POINTER(c_char)))
-            except Exception as e:
-                print('Error in NDArrayOp.list_outputs: ', str(e))
+            except Exception:
+                print('Error in NDArrayOp.list_outputs: %s' % traceback.format_exc())
                 return False
             return True
 
@@ -328,8 +333,8 @@ class NDArrayOp(PythonOp):
                 ret = [c_str(i) for i in ret] + [c_char_p(0)]
                 ret = c_array(c_char_p, ret)
                 out[0] = cast(ret, POINTER(POINTER(c_char)))
-            except Exception as e:
-                print('Error in NDArrayOp.list_arguments: ', str(e))
+            except Exception:
+                print('Error in NDArrayOp.list_arguments: %s' % traceback.format_exc())
                 return False
             return True
 
@@ -343,8 +348,8 @@ class NDArrayOp(PythonOp):
                 num_dep[0] = len(rdeps)
                 rdeps = cast(c_array(c_int, rdeps), c_int_p)
                 deps[0] = rdeps
-            except Exception as e:
-                print('Error in NDArrayOp.declare_backward_dependency: ', str(e))
+            except Exception:
+                print('Error in NDArrayOp.declare_backward_dependency: %s' % traceback.format_exc())
                 return False
             return True
 
@@ -357,9 +362,9 @@ class NDArrayOp(PythonOp):
                                    None, None, None, None, None, None)
         cb_ptr = format(cast(pointer(self.info_), c_void_p).value, 'x')
         # pylint: disable=E1101
-        sym = symbol.Symbol._NDArray(*args,
-                                     info=cb_ptr,
-                                     **kwargs)
+        sym = symbol._internal._NDArray(*args,
+                                        info=cb_ptr,
+                                        **kwargs)
         # keep a reference of ourself in PythonOp so we don't get garbage collected.
         PythonOp._ref_holder.append(self)
         return sym
@@ -529,7 +534,22 @@ class CustomOpProp(object):
         # pylint: disable=W0613
         return CustomOp()
 
-_registry_ref_holder = []
+class _Registry(object):
+    """CustomOp registry"""
+    def __init__(self):
+        self.ref_holder = {}
+        self.counter = 0
+        self.lock = Lock()
+
+    def inc(self):
+        """Get index for new entry"""
+        self.lock.acquire()
+        cur = self.counter
+        self.counter += 1
+        self.lock.release()
+        return cur
+
+_registry = _Registry()
 
 def register(reg_name):
     """Register a subclass of CustomOpProp to the registry with name reg_name."""
@@ -537,13 +557,16 @@ def register(reg_name):
         """Register a subclass of CustomOpProp to the registry."""
         fb_functype = CFUNCTYPE(c_bool, c_int, POINTER(c_void_p), POINTER(c_int),
                                 POINTER(c_int), c_bool, c_void_p)
+        del_functype = CFUNCTYPE(c_bool, c_void_p)
         class CustomOpInfo(Structure):
             """Structure that holds Callback information. Passed to CustomOpProp"""
             _fields_ = [
                 ('forward', fb_functype),
                 ('backward', fb_functype),
+                ('delete', del_functype),
                 ('p_forward', c_void_p),
-                ('p_backward', c_void_p)
+                ('p_backward', c_void_p),
+                ('p_delete', c_void_p)
                 ]
 
         infer_functype = CFUNCTYPE(c_bool, c_int, POINTER(c_int),
@@ -563,19 +586,21 @@ def register(reg_name):
                 ('declare_backward_dependency', deps_functype),
                 ('create_operator', createop_functype),
                 ('list_auxiliary_states', list_functype),
+                ('delete', del_functype),
                 ('p_list_arguments', c_void_p),
                 ('p_list_outputs', c_void_p),
                 ('p_infer_shape', c_void_p),
                 ('p_declare_backward_dependency', c_void_p),
                 ('p_create_operator', c_void_p),
-                ('p_list_auxiliary_states', c_void_p)
+                ('p_list_auxiliary_states', c_void_p),
+                ('p_delete', c_void_p)
                 ]
         req_enum = ['null', 'write', 'inplace', 'add']
 
         def creator(op_type, argc, keys, vals, ret):
             """internal function"""
             assert py_str(op_type) == reg_name
-            kwargs = dict([(keys[i], vals[i]) for i in range(argc)])
+            kwargs = dict([(py_str(keys[i]), py_str(vals[i])) for i in range(argc)])
             op_prop = prop_cls(**kwargs)
 
             def infer_shape_entry(num_tensor, tensor_dims,
@@ -606,8 +631,8 @@ def register(reg_name):
                         tensor_dims[i] = len(rshape[i])
 
                     infer_shape_entry._ref_holder = [tensor_shapes]
-                except Exception as e:
-                    print('Error in %s.infer_shape: '%reg_name, str(e))
+                except Exception:
+                    print('Error in %s.infer_shape: %s' % (reg_name, traceback.format_exc()))
                     return False
                 return True
 
@@ -620,8 +645,8 @@ def register(reg_name):
                     out[0] = cast(ret, POINTER(POINTER(c_char)))
 
                     list_outputs_entry._ref_holder = [out]
-                except Exception as e:
-                    print('Error in %s.list_outputs: '%reg_name, str(e))
+                except Exception:
+                    print('Error in %s.list_outputs: %s' % (reg_name, traceback.format_exc()))
                     return False
                 return True
 
@@ -634,8 +659,8 @@ def register(reg_name):
                     out[0] = cast(ret, POINTER(POINTER(c_char)))
 
                     list_arguments_entry._ref_holder = [out]
-                except Exception as e:
-                    print('Error in %s.list_arguments: '%reg_name, str(e))
+                except Exception:
+                    print('Error in %s.list_arguments: %s' % (reg_name, traceback.format_exc()))
                     return False
                 return True
 
@@ -648,8 +673,9 @@ def register(reg_name):
                     out[0] = cast(ret, POINTER(POINTER(c_char)))
 
                     list_auxiliary_states_entry._ref_holder = [out]
-                except Exception as e:
-                    print('Error in %s.list_auxiliary_states: '%reg_name, str(e))
+                except Exception:
+                    tb = traceback.format_exc()
+                    print('Error in %s.list_auxiliary_states: %s' % (reg_name, tb))
                     return False
                 return True
 
@@ -665,8 +691,9 @@ def register(reg_name):
                     deps[0] = rdeps
 
                     declare_backward_dependency_entry._ref_holder = [deps]
-                except Exception as e:
-                    print('Error in %s.declare_backward_dependency: '%reg_name, str(e))
+                except Exception:
+                    tb = traceback.format_exc()
+                    print('Error in %s.declare_backward_dependency: %s' % (reg_name, tb))
                     return False
                 return True
 
@@ -695,8 +722,8 @@ def register(reg_name):
                             op.forward(is_train=is_train, req=reqs,
                                        in_data=tensors[0], out_data=tensors[1],
                                        aux=tensors[4])
-                        except Exception as e:
-                            print('Error in CustomOp.forward: ', str(e))
+                        except Exception:
+                            print('Error in CustomOp.forward: %s' % traceback.format_exc())
                             return False
                         return True
 
@@ -719,17 +746,41 @@ def register(reg_name):
                                         in_data=tensors[0], out_data=tensors[1],
                                         in_grad=tensors[2], out_grad=tensors[3],
                                         aux=tensors[4])
-                        except Exception as e:
-                            print('Error in CustomOp.backward: ', str(e))
+                        except Exception:
+                            print('Error in CustomOp.backward: %s' % traceback.format_exc())
+                            return False
+                        return True
+
+                    cur = _registry.inc()
+
+                    def delete_entry(_):
+                        """C Callback for CustomOp::del"""
+                        try:
+                            del _registry.ref_holder[cur]
+                        except Exception:
+                            print('Error in CustomOp.delete: %s' % traceback.format_exc())
                             return False
                         return True
 
                     ret[0] = CustomOpInfo(fb_functype(forward_entry),
-                                          fb_functype(backward_entry), None, None)
+                                          fb_functype(backward_entry),
+                                          del_functype(delete_entry),
+                                          None, None, None)
                     op._ref_holder = [ret]
-                    op_prop._ref_holder.append(op)
-                except Exception as e:
-                    print('Error in %s.create_operator: '%reg_name, str(e))
+                    _registry.ref_holder[cur] = op
+                except Exception:
+                    print('Error in %s.create_operator: %s' % (reg_name, traceback.format_exc()))
+                    return False
+                return True
+
+            cur = _registry.inc()
+
+            def delete_entry(_):
+                """C Callback for CustomOpProp::del"""
+                try:
+                    del _registry.ref_holder[cur]
+                except Exception:
+                    print('Error in CustomOpProp.delete: %s' % traceback.format_exc())
                     return False
                 return True
 
@@ -739,16 +790,18 @@ def register(reg_name):
                                       deps_functype(declare_backward_dependency_entry),
                                       createop_functype(create_operator_entry),
                                       list_functype(list_auxiliary_states_entry),
-                                      None, None, None, None, None, None)
+                                      del_functype(delete_entry),
+                                      None, None, None, None, None, None, None)
             op_prop._ref_holder = [ret]
-            _registry_ref_holder.append(op_prop)
+            _registry.ref_holder[cur] = op_prop
             return True
 
         creator_functype = CFUNCTYPE(c_bool, c_char_p, c_int, POINTER(c_char_p),
                                      POINTER(c_char_p), POINTER(CustomOpPropInfo))
         creator_func = creator_functype(creator)
         check_call(_LIB.MXCustomOpRegister(c_str(reg_name), creator_func))
-        _registry_ref_holder.append(creator_func)
+        cur = _registry.inc()
+        _registry.ref_holder[cur] = creator_func
         return prop_cls
     return do_register
 
